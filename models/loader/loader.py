@@ -136,7 +136,10 @@ class LoaderCheckPoint:
                     # 可传入device_map自定义每张卡的部署情况
                     if self.device_map is None:
                         if 'chatglm' in model_name.lower():
-                            self.device_map = self.chatglm_auto_configure_device_map(num_gpus)
+                            if 'chatglm2' in model_name.lower():
+                                self.device_map = self.chatglm2_auto_configure_device_map(num_gpus)
+                            else:
+                                self.device_map = self.chatglm_auto_configure_device_map(num_gpus)
                         elif 'moss' in model_name.lower():
                             self.device_map = self.moss_auto_configure_device_map(num_gpus, model_name)
                         else:
@@ -269,6 +272,48 @@ class LoaderCheckPoint:
                 used = 0
             assert gpu_target < num_gpus
             device_map[f'{layer_prefix}.layers.{i}'] = gpu_target
+            used += 1
+
+        return device_map
+    
+    def chatglm2_auto_configure_device_map(self, num_gpus: int) -> Dict[str, int]:
+        # transformer.word_embeddings 占用1层
+        # transformer.final_layernorm 和 lm_head 占用1层
+        # transformer.layers 占用 28 层
+        # 总共30层分配到num_gpus张卡上
+        num_trans_layers = 28
+        per_gpu_layers = 30 / num_gpus
+
+        # bugfix: PEFT加载lora模型出现的层命名不同
+        if self.lora:
+            layer_prefix = 'base_model.model.transformer'
+        else:
+            layer_prefix = 'transformer'
+
+        # bugfix: 在linux中调用torch.embedding传入的weight,input不在同一device上,导致RuntimeError
+        # windows下 model.device 会被设置成 transformer.word_embeddings.device
+        # linux下 model.device 会被设置成 lm_head.device
+        # 在调用chat或者stream_chat时,input_ids会被放到model.device上
+        # 如果transformer.word_embeddings.device和model.device不同,则会导致RuntimeError
+        # 因此这里将transformer.word_embeddings,transformer.final_layernorm,lm_head都放到第一张卡上
+        # 本文件来源于https://github.com/THUDM/ChatGLM-6B/blob/main/utils.py
+        # 仅此处做少许修改以支持ChatGLM2
+        device_map = {
+            f'{layer_prefix}.embedding.word_embeddings': 0,
+            f'{layer_prefix}.encoder.final_layernorm': 0,
+            f'{layer_prefix}.output_layer': 0,
+            f'{layer_prefix}.rotary_pos_emb': 0,
+            'lm_head': 0
+        }
+
+        used = 2
+        gpu_target = 0
+        for i in range(num_trans_layers):
+            if used >= per_gpu_layers:
+                gpu_target += 1
+                used = 0
+            assert gpu_target < num_gpus
+            device_map[f'transformer.encoder.layers.{i}'] = gpu_target
             used += 1
 
         return device_map
